@@ -17,14 +17,14 @@ services:
     environment:
       GST_VIDEO_CONVERT_USE_RGA: "1"
       GST_VIDEO_CONVERT_RGA_DMA_HEAP: /dev/dma_heap/cma
-    devices:
-      - /dev/dri/card1:/dev/dri/card1
-      - /dev/rga:/dev/rga
-      - /dev/dma_heap/cma:/dev/dma_heap/cma
-      - ${V4L2_DEVICE:-/dev/video0}:${V4L2_DEVICE:-/dev/video0}
+    privileged: true
     volumes:
       - ${GST_INPUT_PATH:-./assets/test.jpg}:/input.jpg:ro
       - ./output:/output
+      - /usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstrockchipmpp.so:/usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstrockchipmpp.so:ro
+      - /lib/aarch64-linux-gnu/librockchip_mpp.so.0:/usr/lib/aarch64-linux-gnu/librockchip_mpp.so.1:ro
+      - /usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstvideoparsersbad.so:/usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstvideoparsersbad.so:ro
+      - /usr/lib/aarch64-linux-gnu/libgstcodecparsers-1.0.so.0.2402.0:/usr/lib/aarch64-linux-gnu/libgstcodecparsers-1.0.so.0:ro
     command:
       - -e
       - filesrc

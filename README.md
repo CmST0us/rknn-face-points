@@ -20,6 +20,14 @@ GStreamer 单图管线：
 
 结果为 `output/gstreamer-face.jpg`。
 
+MPP 文件解码、打点和编码：
+
+```sh
+./run-video.sh [H.264 MP4/MOV 路径]
+```
+
+结果为 `output/face-output.mp4`；视频链路使用 `mppvideodec`、RGA `videoconvert`、`rknnfacemesh` 和 `mpph264enc`（不保留音轨）。
+
 V4L2 实时输入：
 
 ```sh
@@ -51,7 +59,7 @@ GST_VIDEO_CONVERT_RGA_DMA_HEAP=/dev/dma_heap/cma
 
 镜像内的 GStreamer 1.24.2 `libgstvideo` 同时链接 Rockchip `librga` 和 ORC：支持格式走 RGA；RGA 不支持或失败时回退到 ORC 的 AArch64 NEON 路径。CMA DMA buffer 修复了 RK3588 旧补丁使用 4GB 以上虚拟地址时的 `RGA_BLIT EINVAL`。
 
-容器仅映射所需设备：NPU `/dev/dri/card1`、`/dev/rga`、CMA DMA heap 和 V4L2 设备，不使用 `--privileged`。
+Rockchip MPP 在容器内导出解码帧需要访问板端媒体设备与 DMA heaps，因此 `gstreamer-face` 服务使用 `privileged: true`；RKNN 单图服务仍只映射 NPU。Rockchip MPP 插件和运行库从目标设备只读挂载，保持与板端驱动匹配。
 
 ## 构建
 
