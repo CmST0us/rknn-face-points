@@ -1,0 +1,10 @@
+services:
+  face-rknn:
+    build: .
+    image: face-rknn-demo:2.3.2
+    devices:
+      - /dev/dri/card1:/dev/dri/card1
+    volumes:
+      - ${INPUT_PATH:-./assets/test.jpg}:/input.jpg:ro
+      - ./output:/output
+    command: ["/input.jpg", "/output/face_result.ppm", "/app/models"]
