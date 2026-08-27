@@ -1,9 +1,4 @@
-assets
-include
+.git
 output
-scripts
-src
-third_party
 README.md
-compose.yaml
-run.sh
+*.tar.gz

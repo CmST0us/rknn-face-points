@@ -1,0 +1,22 @@
+FROM ubuntu:24.04 AS build
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential ca-certificates curl meson ninja-build pkg-config xz-utils \
+      libglib2.0-dev libgstreamer1.0-dev liborc-0.4-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY rockchip/include/rga /usr/include/rga
+COPY rockchip/librga.so.2 /usr/lib/aarch64-linux-gnu/
+COPY rockchip/librga.pc /usr/lib/pkgconfig/
+RUN ln -sf librga.so.2 /usr/lib/aarch64-linux-gnu/librga.so
+WORKDIR /src
+RUN curl -fsSL https://gstreamer.freedesktop.org/src/gst-plugins-base/gst-plugins-base-1.24.2.tar.xz \
+    | tar -xJ --strip-components=1
+COPY rockchip/gst-video-converter-rga.patch /tmp/rga.patch
+COPY rockchip/gst-video-converter-rga-dma-heap.patch /tmp/rga-dma.patch
+RUN patch -p1 < /tmp/rga.patch && patch -p1 < /tmp/rga-dma.patch \
+    && meson setup build --buildtype=release -Dorc=enabled -Dexamples=disabled -Dtests=disabled \
+         -Dtools=disabled -Dintrospection=disabled -Dnls=disabled \
+    && ninja -C build gst-libs/gst/video/libgstvideo-1.0.so.0.2402.0
+
+FROM scratch AS export
+COPY --from=build /src/build/gst-libs/gst/video/libgstvideo-1.0.so.0.2402.0 /

@@ -1,0 +1,229 @@
+--- a/gst-libs/gst/video/video-converter.c
++++ b/gst-libs/gst/video/video-converter.c
+@@ -39,8 +39,14 @@
+ #include "video-orc.h"
+ 
+ #ifdef HAVE_RGA
++#include <fcntl.h>
++#include <linux/dma-buf.h>
++#include <linux/dma-heap.h>
+ #include <rga/rga.h>
+ #include <rga/RgaApi.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <unistd.h>
+ #endif
+ 
+ /**
+@@ -343,6 +349,15 @@
+ typedef void (*FastConvertFunc) (GstVideoConverter * convert,
+     const GstVideoFrame * src, GstVideoFrame * dest, gint plane);
+ 
++#ifdef HAVE_RGA
++typedef struct
++{
++  gint fd;
++  gpointer ptr;
++  gsize size;
++} RgaDmaBuffer;
++#endif
++
+ struct _GstVideoConverter
+ {
+   gint flags;
+@@ -484,6 +499,12 @@
+   /* for parallel async running */
+   gpointer tasks[4];
+   gpointer tasks_p[4];
++
++#ifdef HAVE_RGA
++  GMutex rga_lock;
++  RgaDmaBuffer rga_src;
++  RgaDmaBuffer rga_dst;
++#endif
+ };
+ 
+ typedef gpointer (*GstLineCacheAllocLineFunc) (GstLineCache * cache, gint idx,
+@@ -2335,6 +2356,9 @@
+       NULL);
+ 
+   convert = g_new0 (GstVideoConverter, 1);
++#ifdef HAVE_RGA
++  g_mutex_init (&convert->rga_lock);
++#endif
+ 
+   fin = in_info->finfo;
+   fout = out_info->finfo;
+@@ -2681,6 +2705,18 @@
+     g_free (convert->tasks[i]);
+     g_free (convert->tasks_p[i]);
+   }
++
++#ifdef HAVE_RGA
++  if (convert->rga_src.ptr) {
++    munmap (convert->rga_src.ptr, convert->rga_src.size);
++    close (convert->rga_src.fd);
++  }
++  if (convert->rga_dst.ptr) {
++    munmap (convert->rga_dst.ptr, convert->rga_dst.size);
++    close (convert->rga_dst.fd);
++  }
++  g_mutex_clear (&convert->rga_lock);
++#endif
+ 
+   g_free (convert);
+ }
+@@ -2784,7 +2820,7 @@
+ 
+ static gboolean
+ get_rga_info (const GstVideoFrame * frame, rga_info_t * info,
+-    int x, int y, int w, int h)
++    int x, int y, int w, int h, gsize * size)
+ {
+   GstVideoMeta *meta = gst_buffer_get_video_meta (frame->buffer);
+   const GstVideoInfo *vinfo = &frame->info;
+@@ -2794,9 +2830,13 @@
+ 
+   memset (info, 0, sizeof (rga_info_t));
+ 
+-  if (!meta)
++  if (!meta || meta->offset[0] != 0)
+     return FALSE;
+ 
++  *size = gst_buffer_get_size (frame->buffer);
++  if (*size == 0)
++    return FALSE;
++
+   hstride = meta->stride[0];
+   vstride0 = meta->n_planes == 1 ? meta->height : meta->offset[1] / hstride;
+ 
+@@ -2859,12 +2899,70 @@
+   return TRUE;
+ }
+ 
++static void
++release_rga_dma_buffer (RgaDmaBuffer * buffer)
++{
++  if (!buffer->ptr)
++    return;
++
++  munmap (buffer->ptr, buffer->size);
++  close (buffer->fd);
++  memset (buffer, 0, sizeof (*buffer));
++}
++
+ static gboolean
++ensure_rga_dma_buffer (RgaDmaBuffer * buffer, gsize size)
++{
++  struct dma_heap_allocation_data data = { 0 };
++  const gchar *heap_path = g_getenv ("GST_VIDEO_CONVERT_RGA_DMA_HEAP");
++  gint heap_fd;
++
++  if (buffer->ptr && buffer->size >= size)
++    return TRUE;
++
++  release_rga_dma_buffer (buffer);
++  if (!heap_path)
++    heap_path = "/dev/dma_heap/cma";
++  heap_fd = open (heap_path, O_RDONLY | O_CLOEXEC);
++  if (heap_fd < 0)
++    return FALSE;
++
++  data.len = (size + 4095) & ~((gsize) 4095);
++  data.fd_flags = O_RDWR | O_CLOEXEC;
++  if (ioctl (heap_fd, DMA_HEAP_IOCTL_ALLOC, &data) < 0) {
++    close (heap_fd);
++    return FALSE;
++  }
++  close (heap_fd);
++
++  buffer->ptr = mmap (NULL, data.len, PROT_READ | PROT_WRITE, MAP_SHARED,
++      data.fd, 0);
++  if (buffer->ptr == MAP_FAILED) {
++    buffer->ptr = NULL;
++    close (data.fd);
++    return FALSE;
++  }
++  buffer->fd = data.fd;
++  buffer->size = data.len;
++  return TRUE;
++}
++
++static gboolean
++sync_rga_dma_buffer (gint fd, guint64 flags)
++{
++  struct dma_buf_sync sync = { .flags = flags };
++  return ioctl (fd, DMA_BUF_IOCTL_SYNC, &sync) == 0;
++}
++
++static gboolean
+ video_converter_try_rga (GstVideoConverter * convert,
+     const GstVideoFrame * src, GstVideoFrame * dest)
+ {
+   rga_info_t src_info = { 0 };
+   rga_info_t dst_info = { 0 };
++  gpointer src_ptr, dst_ptr;
++  gsize src_size, dst_size;
++  gboolean converted = FALSE;
+   static int rga_supported = 1;
+   static int rga_inited = 0;
+   const char *buf;
+@@ -2885,22 +2983,55 @@
+   }
+ 
+   if (!get_rga_info (src, &src_info, convert->in_x, convert->in_y,
+-          convert->in_width, convert->in_height)) {
++          convert->in_width, convert->in_height, &src_size)) {
+     GST_DEBUG ("unsupported src info for RGA");
+     return FALSE;
+   }
+ 
+   if (!get_rga_info (dest, &dst_info, convert->out_x, convert->out_y,
+-          convert->out_width, convert->out_height)) {
++          convert->out_width, convert->out_height, &dst_size)) {
+     GST_DEBUG ("unsupported dst info for RGA");
+     return FALSE;
+   }
+ 
++  src_ptr = src_info.virAddr;
++  dst_ptr = dst_info.virAddr;
++  g_mutex_lock (&convert->rga_lock);
++  if (!ensure_rga_dma_buffer (&convert->rga_src, src_size) ||
++      !ensure_rga_dma_buffer (&convert->rga_dst, dst_size))
++    goto done;
++
++  if (!sync_rga_dma_buffer (convert->rga_src.fd,
++          DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE))
++    goto done;
++  memcpy (convert->rga_src.ptr, src_ptr, src_size);
++  if (!sync_rga_dma_buffer (convert->rga_src.fd,
++          DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE))
++    goto done;
++
++  src_info.virAddr = NULL;
++  src_info.fd = convert->rga_src.fd;
++  dst_info.virAddr = NULL;
++  dst_info.fd = convert->rga_dst.fd;
+   if (c_RkRgaBlit (&src_info, &dst_info, NULL) < 0) {
+     GST_DEBUG ("failed to blit with RGA");
+-    return FALSE;
++    goto done;
+   }
+ 
++  if (!sync_rga_dma_buffer (convert->rga_dst.fd,
++          DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ))
++    goto done;
++  memcpy (dst_ptr, convert->rga_dst.ptr, dst_size);
++  if (!sync_rga_dma_buffer (convert->rga_dst.fd,
++          DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ))
++    goto done;
++  converted = TRUE;
++
++done:
++  g_mutex_unlock (&convert->rga_lock);
++  if (!converted)
++    return FALSE;
++
+   GST_DEBUG ("converted with RGA");
+   return TRUE;
+ }

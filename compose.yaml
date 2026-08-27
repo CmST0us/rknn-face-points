@@ -8,3 +8,37 @@ services:
       - ${INPUT_PATH:-./assets/test.jpg}:/input.jpg:ro
       - ./output:/output
     command: ["/input.jpg", "/output/face_result.ppm", "/app/models"]
+
+  gstreamer-face:
+    build:
+      context: .
+      dockerfile: Dockerfile.gstreamer
+    image: face-rknn-gstreamer:1.0.0
+    environment:
+      GST_VIDEO_CONVERT_USE_RGA: "1"
+      GST_VIDEO_CONVERT_RGA_DMA_HEAP: /dev/dma_heap/cma
+    devices:
+      - /dev/dri/card1:/dev/dri/card1
+      - /dev/rga:/dev/rga
+      - /dev/dma_heap/cma:/dev/dma_heap/cma
+      - ${V4L2_DEVICE:-/dev/video0}:${V4L2_DEVICE:-/dev/video0}
+    volumes:
+      - ${GST_INPUT_PATH:-./assets/test.jpg}:/input.jpg:ro
+      - ./output:/output
+    command:
+      - -e
+      - filesrc
+      - location=/input.jpg
+      - "!"
+      - jpegdec
+      - "!"
+      - videoconvert
+      - "!"
+      - video/x-raw,format=RGB
+      - "!"
+      - rknnfacemesh
+      - "!"
+      - jpegenc
+      - "!"
+      - filesink
+      - location=/output/gstreamer-face.jpg
