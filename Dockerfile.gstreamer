@@ -4,12 +4,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
     && rm -rf /var/lib/apt/lists/*
 COPY bin/libgstrknnface.so /usr/lib/aarch64-linux-gnu/gstreamer-1.0/
-COPY rockchip/libgstvideo-1.0.so.0.2402.0 /usr/lib/aarch64-linux-gnu/
 COPY rockchip/librga.so.2 /usr/lib/aarch64-linux-gnu/
-RUN ln -sf libgstvideo-1.0.so.0.2402.0 /usr/lib/aarch64-linux-gnu/libgstvideo-1.0.so.0
 COPY include/gst_rknn_face_meta.h /usr/local/include/
 COPY lib/librknnrt.so /opt/face-rknn/lib/librknnrt.so
 COPY models/ /app/models/
 ENV LD_LIBRARY_PATH=/opt/face-rknn/lib
-ENV GST_VIDEO_CONVERT_USE_RGA=1
 ENTRYPOINT ["gst-launch-1.0"]

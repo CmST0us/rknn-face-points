@@ -1,8 +1,13 @@
 #include "face_tracker.h"
 #include "gst_rknn_face_meta.h"
 
+#include <gst/allocators/gstdmabuf.h>
 #include <gst/video/gstvideofilter.h>
 
+#include <linux/dma-buf.h>
+#include <sys/ioctl.h>
+
+#include <cerrno>
 #include <cstring>
 #include <exception>
 
@@ -72,7 +77,11 @@ typedef struct _GstRknnFaceMesh {
   GstVideoFilter parent;
   gchar* model_dir;
   gboolean draw;
+  guint inference_interval;
+  guint64 frame_number;
+  gboolean last_found;
   rknn_face::Tracker* tracker;
+  rknn_face::Result* last_result;
 } GstRknnFaceMesh;
 
 typedef struct _GstRknnFaceMeshClass {
@@ -88,12 +97,35 @@ enum {
   PROP_0,
   PROP_MODEL_DIR,
   PROP_DRAW,
+  PROP_INFERENCE_INTERVAL,
 };
 
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE(
-    "sink", GST_PAD_SINK, GST_PAD_ALWAYS, GST_STATIC_CAPS("video/x-raw, format=(string)RGB"));
+    "sink", GST_PAD_SINK, GST_PAD_ALWAYS, GST_STATIC_CAPS("video/x-raw, format=(string)NV12"));
 static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE(
-    "src", GST_PAD_SRC, GST_PAD_ALWAYS, GST_STATIC_CAPS("video/x-raw, format=(string)RGB"));
+    "src", GST_PAD_SRC, GST_PAD_ALWAYS, GST_STATIC_CAPS("video/x-raw, format=(string)NV12"));
+
+static gboolean sync_dmabufs(GstBuffer* buffer, guint64 flags, gchar** error) {
+  guint count = gst_buffer_n_memory(buffer);
+  if (!count) {
+    *error = g_strdup("buffer has no memory");
+    return FALSE;
+  }
+  for (guint i = 0; i < count; ++i) {
+    GstMemory* memory = gst_buffer_peek_memory(buffer, i);
+    if (!gst_is_dmabuf_memory(memory)) {
+      *error = g_strdup_printf("memory %u is not DMABUF", i);
+      return FALSE;
+    }
+    dma_buf_sync sync{flags};
+    int fd = gst_dmabuf_memory_get_fd(memory);
+    if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) < 0) {
+      *error = g_strdup_printf("DMABUF fd %d sync failed: %s", fd, g_strerror(errno));
+      return FALSE;
+    }
+  }
+  return TRUE;
+}
 
 static void gst_rknn_face_mesh_set_property(GObject* object, guint id,
                                             const GValue* value, GParamSpec* spec) {
@@ -105,6 +137,9 @@ static void gst_rknn_face_mesh_set_property(GObject* object, guint id,
       break;
     case PROP_DRAW:
       self->draw = g_value_get_boolean(value);
+      break;
+    case PROP_INFERENCE_INTERVAL:
+      self->inference_interval = g_value_get_uint(value);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, id, spec);
@@ -121,6 +156,9 @@ static void gst_rknn_face_mesh_get_property(GObject* object, guint id,
     case PROP_DRAW:
       g_value_set_boolean(value, self->draw);
       break;
+    case PROP_INFERENCE_INTERVAL:
+      g_value_set_uint(value, self->inference_interval);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, id, spec);
   }
@@ -130,8 +168,12 @@ static gboolean gst_rknn_face_mesh_start(GstBaseTransform* transform) {
   auto* self = GST_RKNN_FACE_MESH(transform);
   try {
     self->tracker = new rknn_face::Tracker(self->model_dir);
+    self->last_result = new rknn_face::Result;
+    self->frame_number = 0;
     return TRUE;
   } catch (const std::exception& e) {
+    delete self->tracker;
+    self->tracker = nullptr;
     GST_ELEMENT_ERROR(self, RESOURCE, OPEN_READ, ("failed to load RKNN models"), ("%s", e.what()));
     return FALSE;
   }
@@ -140,7 +182,9 @@ static gboolean gst_rknn_face_mesh_start(GstBaseTransform* transform) {
 static gboolean gst_rknn_face_mesh_stop(GstBaseTransform* transform) {
   auto* self = GST_RKNN_FACE_MESH(transform);
   delete self->tracker;
+  delete self->last_result;
   self->tracker = nullptr;
+  self->last_result = nullptr;
   return TRUE;
 }
 
@@ -149,31 +193,48 @@ static GstFlowReturn gst_rknn_face_mesh_transform_frame_ip(GstVideoFilter* filte
   auto* self = GST_RKNN_FACE_MESH(filter);
   int width = GST_VIDEO_FRAME_WIDTH(frame);
   int height = GST_VIDEO_FRAME_HEIGHT(frame);
-  int stride = GST_VIDEO_FRAME_PLANE_STRIDE(frame, 0);
-  auto* pixels = static_cast<unsigned char*>(GST_VIDEO_FRAME_PLANE_DATA(frame, 0));
-  if (stride < width * 3) {
-    GST_ELEMENT_ERROR(self, STREAM, FORMAT, ("invalid RGB stride"), ("stride=%d width=%d", stride, width));
+  rknn_face::Nv12Image image{
+      width, height,
+      GST_VIDEO_FRAME_PLANE_STRIDE(frame, 0), GST_VIDEO_FRAME_PLANE_STRIDE(frame, 1),
+      static_cast<unsigned char*>(GST_VIDEO_FRAME_PLANE_DATA(frame, 0)),
+      static_cast<unsigned char*>(GST_VIDEO_FRAME_PLANE_DATA(frame, 1))};
+  if (GST_VIDEO_FRAME_N_PLANES(frame) != 2 || image.y_stride < width || image.uv_stride < width) {
+    GST_ELEMENT_ERROR(self, STREAM, FORMAT, ("invalid NV12 frame"),
+                      ("planes=%u strides=%d,%d width=%d",
+                       GST_VIDEO_FRAME_N_PLANES(frame), image.y_stride, image.uv_stride, width));
     return GST_FLOW_ERROR;
   }
 
-  rknn_face::Image image{width, height, std::vector<unsigned char>(static_cast<size_t>(width) * height * 3)};
-  for (int y = 0; y < height; ++y)
-    std::memcpy(image.rgb.data() + static_cast<size_t>(y) * width * 3, pixels + y * stride, width * 3);
+  gchar* sync_error = nullptr;
+  if (!sync_dmabufs(frame->buffer, DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW, &sync_error)) {
+    GST_ELEMENT_ERROR(self, STREAM, FAILED, ("DMABUF zero-copy input required"), ("%s", sync_error));
+    g_free(sync_error);
+    return GST_FLOW_ERROR;
+  }
 
-  rknn_face::Result result;
-  bool found = false;
+  gboolean inferred = self->frame_number++ % self->inference_interval == 0;
   try {
-    found = self->tracker->process(image, result);
+    if (inferred) self->last_found = self->tracker->process(image, *self->last_result);
+    if (self->last_found && self->draw) rknn_face::draw(image, *self->last_result);
   } catch (const std::exception& e) {
+    sync_dmabufs(frame->buffer, DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW, &sync_error);
+    g_free(sync_error);
     GST_ELEMENT_ERROR(self, STREAM, FAILED, ("RKNN inference failed"), ("%s", e.what()));
     return GST_FLOW_ERROR;
   }
 
+  if (!sync_dmabufs(frame->buffer, DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW, &sync_error)) {
+    GST_ELEMENT_ERROR(self, STREAM, FAILED, ("DMABUF zero-copy output sync failed"), ("%s", sync_error));
+    g_free(sync_error);
+    return GST_FLOW_ERROR;
+  }
+
   auto* meta = gst_buffer_add_rknn_face_meta(frame->buffer);
-  meta->found = found;
+  const auto& result = *self->last_result;
+  meta->found = self->last_found;
   meta->score = result.score;
-  meta->npu_ms = result.detector_ms + result.landmark_ms + result.blendshape_ms;
-  if (found) {
+  meta->npu_ms = inferred ? result.detector_ms + result.landmark_ms + result.blendshape_ms : 0;
+  if (self->last_found) {
     meta->landmark_count = static_cast<guint>(result.landmarks.size());
     meta->bbox[0] = result.bbox_x;
     meta->bbox[1] = result.bbox_y;
@@ -187,11 +248,6 @@ static GstFlowReturn gst_rknn_face_mesh_transform_frame_ip(GstVideoFilter* filte
       meta->landmarks[i][1] = result.landmarks[i].y;
       meta->landmarks[i][2] = result.landmarks[i].z;
     }
-    if (self->draw) {
-      rknn_face::draw(image, result);
-      for (int y = 0; y < height; ++y)
-        std::memcpy(pixels + y * stride, image.rgb.data() + static_cast<size_t>(y) * width * 3, width * 3);
-    }
   }
   return GST_FLOW_OK;
 }
@@ -199,6 +255,7 @@ static GstFlowReturn gst_rknn_face_mesh_transform_frame_ip(GstVideoFilter* filte
 static void gst_rknn_face_mesh_finalize(GObject* object) {
   auto* self = GST_RKNN_FACE_MESH(object);
   delete self->tracker;
+  delete self->last_result;
   g_free(self->model_dir);
   G_OBJECT_CLASS(gst_rknn_face_mesh_parent_class)->finalize(object);
 }
@@ -217,6 +274,10 @@ static void gst_rknn_face_mesh_class_init(GstRknnFaceMeshClass* klass) {
   g_object_class_install_property(object_class, PROP_DRAW,
       g_param_spec_boolean("draw", "Draw landmarks", "Draw the face box and 478 landmarks on output frames",
                            TRUE, static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property(object_class, PROP_INFERENCE_INTERVAL,
+      g_param_spec_uint("inference-interval", "Inference interval",
+                        "Run RKNN every N frames and reuse the last result between runs",
+                        1, 60, 2, static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
   gst_element_class_set_static_metadata(element_class, "RKNN face mesh", "Filter/Video",
       "RK3588 face detection, 478 landmarks, head pose and blendshapes", "CmST0us");
   gst_element_class_add_static_pad_template(element_class, &sink_template);
@@ -229,7 +290,12 @@ static void gst_rknn_face_mesh_class_init(GstRknnFaceMeshClass* klass) {
 static void gst_rknn_face_mesh_init(GstRknnFaceMesh* self) {
   self->model_dir = g_strdup("/app/models");
   self->draw = TRUE;
+  // ponytail: 30 Hz inference keeps 60 fps media real-time; set interval=1 when every frame must be fresh.
+  self->inference_interval = 2;
+  self->frame_number = 0;
+  self->last_found = FALSE;
   self->tracker = nullptr;
+  self->last_result = nullptr;
   gst_base_transform_set_in_place(GST_BASE_TRANSFORM(self), TRUE);
 }
 

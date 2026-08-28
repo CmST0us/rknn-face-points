@@ -14,9 +14,6 @@ services:
       context: .
       dockerfile: Dockerfile.gstreamer
     image: face-rknn-gstreamer:1.0.0
-    environment:
-      GST_VIDEO_CONVERT_USE_RGA: "1"
-      GST_VIDEO_CONVERT_RGA_DMA_HEAP: /dev/dma_heap/cma
     privileged: true
     volumes:
       - ${GST_INPUT_PATH:-./assets/test.jpg}:/input.jpg:ro
@@ -30,15 +27,15 @@ services:
       - filesrc
       - location=/input.jpg
       - "!"
-      - jpegdec
+      - jpegparse
       - "!"
-      - videoconvert
-      - "!"
-      - video/x-raw,format=RGB
+      - mppjpegdec
+      - dma-feature=true
+      - format=NV12
       - "!"
       - rknnfacemesh
       - "!"
-      - jpegenc
+      - mppjpegenc
       - "!"
       - filesink
       - location=/output/gstreamer-face.jpg

@@ -17,6 +17,13 @@ struct Image {
   std::vector<unsigned char> rgb;
 };
 
+struct Nv12Image {
+  int w = 0, h = 0;
+  int y_stride = 0, uv_stride = 0;
+  unsigned char* y = nullptr;
+  unsigned char* uv = nullptr;
+};
+
 struct Result {
   float score = 0;
   float bbox_x = 0, bbox_y = 0, bbox_w = 0, bbox_h = 0;
@@ -36,6 +43,7 @@ class Tracker {
   Tracker& operator=(const Tracker&) = delete;
 
   bool process(const Image& image, Result& result);
+  bool process(const Nv12Image& image, Result& result);
 
  private:
   struct Impl;
@@ -43,6 +51,7 @@ class Tracker {
 };
 
 void draw(Image& image, const Result& result);
+void draw(Nv12Image& image, const Result& result);
 const char* blendshape_name(std::size_t index);
 
 }  // namespace rknn_face

@@ -2,7 +2,7 @@ FROM ubuntu:24.04 AS build
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential ca-certificates curl meson ninja-build pkg-config xz-utils \
-      libglib2.0-dev libgstreamer1.0-dev liborc-0.4-dev \
+      libglib2.0-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev liborc-0.4-dev \
     && rm -rf /var/lib/apt/lists/*
 COPY rockchip/include/rga /usr/include/rga
 COPY rockchip/librga.so.2 /usr/lib/aarch64-linux-gnu/

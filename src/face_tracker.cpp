@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <stdexcept>
 
@@ -25,56 +27,85 @@ class RknnModel {
   explicit RknnModel(const std::string& path) {
     auto bytes = read_file(path);
     if (bytes.empty()) throw std::runtime_error("cannot read " + path);
-    check(rknn_init(&ctx_, bytes.data(), bytes.size(), 0, nullptr), "rknn_init");
-    rknn_input_output_num io{};
-    check(rknn_query(ctx_, RKNN_QUERY_IN_OUT_NUM, &io, sizeof(io)), "query io");
-    inputs_.resize(io.n_input);
-    outputs_.resize(io.n_output);
-    for (uint32_t i = 0; i < io.n_input; ++i) {
-      inputs_[i].index = i;
-      check(rknn_query(ctx_, RKNN_QUERY_INPUT_ATTR, &inputs_[i], sizeof(inputs_[i])), "query input");
-    }
-    for (uint32_t i = 0; i < io.n_output; ++i) {
-      outputs_[i].index = i;
-      check(rknn_query(ctx_, RKNN_QUERY_OUTPUT_ATTR, &outputs_[i], sizeof(outputs_[i])), "query output");
+    try {
+      check(rknn_init(&ctx_, bytes.data(), bytes.size(), 0, nullptr), "rknn_init");
+      rknn_input_output_num io{};
+      check(rknn_query(ctx_, RKNN_QUERY_IN_OUT_NUM, &io, sizeof(io)), "query io");
+      if (io.n_input != 1) throw std::runtime_error("expected one model input");
+
+      input_attr_.index = 0;
+      check(rknn_query(ctx_, RKNN_QUERY_NATIVE_INPUT_ATTR, &input_attr_, sizeof(input_attr_)),
+            "query native input");
+      if (input_attr_.type != RKNN_TENSOR_FLOAT16)
+        throw std::runtime_error("expected FP16 model input");
+      input_attr_.pass_through = 1;
+      input_mem_ = rknn_create_mem(ctx_, input_attr_.size_with_stride);
+      if (!input_mem_) throw std::runtime_error("create input memory failed");
+      check(rknn_set_io_mem(ctx_, input_mem_, &input_attr_), "set input memory");
+
+      outputs_.resize(io.n_output);
+      for (uint32_t i = 0; i < io.n_output; ++i) {
+        auto& output = outputs_[i];
+        output.attr.index = i;
+        check(rknn_query(ctx_, RKNN_QUERY_OUTPUT_ATTR, &output.attr, sizeof(output.attr)),
+              "query output");
+        output.attr.type = RKNN_TENSOR_FLOAT32;
+        output.attr.size = output.attr.n_elems * sizeof(float);
+        output.attr.size_with_stride = output.attr.size;
+        output.attr.pass_through = 0;
+        output.mem = rknn_create_mem(ctx_, output.attr.size);
+        if (!output.mem) throw std::runtime_error("create output memory failed");
+        check(rknn_set_io_mem(ctx_, output.mem, &output.attr), "set output memory");
+      }
+    } catch (...) {
+      cleanup();
+      throw;
     }
   }
 
-  ~RknnModel() { if (ctx_) rknn_destroy(ctx_); }
+  ~RknnModel() { cleanup(); }
 
-  std::vector<std::vector<float>> run(const std::vector<float>& input, double* ms) {
-    if (inputs_.size() != 1 || input.size() != inputs_[0].n_elems)
-      throw std::runtime_error("bad input element count");
-    rknn_input in{};
-    in.index = 0;
-    in.buf = const_cast<float*>(input.data());
-    in.size = static_cast<uint32_t>(input.size() * sizeof(float));
-    in.type = RKNN_TENSOR_FLOAT32;
-    in.fmt = inputs_[0].n_dims == 4 ? RKNN_TENSOR_NHWC : inputs_[0].fmt;
-    check(rknn_inputs_set(ctx_, 1, &in), "inputs_set");
+  uint16_t* input() { return static_cast<uint16_t*>(input_mem_->virt_addr); }
+  size_t input_size() const { return input_attr_.n_elems; }
+
+  void run(double* ms) {
+    check(rknn_mem_sync(ctx_, input_mem_, RKNN_MEMORY_SYNC_TO_DEVICE), "sync input");
     auto start = std::chrono::steady_clock::now();
     check(rknn_run(ctx_, nullptr), "rknn_run");
     *ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - start).count();
-
-    std::vector<rknn_output> desc(outputs_.size());
-    for (auto& out : desc) out.want_float = 1;
-    check(rknn_outputs_get(ctx_, desc.size(), desc.data(), nullptr), "outputs_get");
-    std::vector<std::vector<float>> result(outputs_.size());
-    for (size_t i = 0; i < outputs_.size(); ++i) {
-      auto* p = static_cast<float*>(desc[i].buf);
-      result[i].assign(p, p + outputs_[i].n_elems);
-    }
-    rknn_outputs_release(ctx_, desc.size(), desc.data());
-    return result;
+    for (auto& output : outputs_)
+      check(rknn_mem_sync(ctx_, output.mem, RKNN_MEMORY_SYNC_FROM_DEVICE), "sync output");
   }
 
+  const float* output(size_t index) const {
+    return static_cast<const float*>(outputs_.at(index).mem->virt_addr);
+  }
+  size_t output_size(size_t index) const { return outputs_.at(index).attr.n_elems; }
+
  private:
+  struct Output {
+    rknn_tensor_attr attr{};
+    rknn_tensor_mem* mem = nullptr;
+  };
+
   static void check(int rc, const char* what) {
     if (rc != RKNN_SUCC) throw std::runtime_error(std::string(what) + ": " + std::to_string(rc));
   }
+  void cleanup() {
+    for (auto& output : outputs_)
+      if (output.mem) rknn_destroy_mem(ctx_, output.mem);
+    if (input_mem_) rknn_destroy_mem(ctx_, input_mem_);
+    if (ctx_) rknn_destroy(ctx_);
+    outputs_.clear();
+    input_mem_ = nullptr;
+    ctx_ = 0;
+  }
+
   rknn_context ctx_ = 0;
-  std::vector<rknn_tensor_attr> inputs_, outputs_;
+  rknn_tensor_attr input_attr_{};
+  rknn_tensor_mem* input_mem_ = nullptr;
+  std::vector<Output> outputs_;
 };
 
 void sample_rgb(const Image& image, float x, float y, float* out) {
@@ -96,29 +127,53 @@ void sample_rgb(const Image& image, float x, float y, float* out) {
   }
 }
 
+void sample_rgb(const Nv12Image& image, float x, float y, float* out) {
+  if (x < -0.5f || y < -0.5f || x > image.w - 0.5f || y > image.h - 0.5f) {
+    out[0] = out[1] = out[2] = 0;
+    return;
+  }
+  // ponytail: nearest sampling sustains 60fps; use RGA affine preprocessing if subpixel accuracy is required.
+  int ix = std::clamp(static_cast<int>(x + 0.5f), 0, image.w - 1);
+  int iy = std::clamp(static_cast<int>(y + 0.5f), 0, image.h - 1);
+  size_t chroma = static_cast<size_t>(iy / 2) * image.uv_stride + (ix / 2) * 2;
+  float c = std::max(0.0f, image.y[iy * image.y_stride + ix] - 16.0f);
+  float u = image.uv[chroma] - 128.0f;
+  float v = image.uv[chroma + 1] - 128.0f;
+  out[0] = std::clamp(1.164f * c + 1.793f * v, 0.0f, 255.0f);
+  out[1] = std::clamp(1.164f * c - 0.213f * u - 0.533f * v, 0.0f, 255.0f);
+  out[2] = std::clamp(1.164f * c + 2.112f * u, 0.0f, 255.0f);
+}
+
 struct Letterbox {
   float scale;
   int pad_x, pad_y, resized_w, resized_h;
 };
 
-std::vector<float> detector_input(const Image& image, Letterbox& box) {
+uint16_t half_bits(float value) {
+  _Float16 half = static_cast<_Float16>(value);
+  uint16_t bits;
+  std::memcpy(&bits, &half, sizeof(bits));
+  return bits;
+}
+
+template <typename T>
+void detector_input(const T& image, Letterbox& box, uint16_t* input) {
   constexpr int size = 128;
   box.scale = std::min(size / static_cast<float>(image.w), size / static_cast<float>(image.h));
   box.resized_w = std::max(1, static_cast<int>(std::round(image.w * box.scale)));
   box.resized_h = std::max(1, static_cast<int>(std::round(image.h * box.scale)));
   box.pad_x = (size - box.resized_w) / 2;
   box.pad_y = (size - box.resized_h) / 2;
-  std::vector<float> input(size * size * 3, -1.0f);
+  std::fill_n(input, size * size * 3, half_bits(-1.0f));
   for (int y = 0; y < box.resized_h; ++y) {
     for (int x = 0; x < box.resized_w; ++x) {
       float rgb[3];
       sample_rgb(image, (x + 0.5f) / box.scale - 0.5f,
                  (y + 0.5f) / box.scale - 0.5f, rgb);
       size_t dst = ((y + box.pad_y) * size + x + box.pad_x) * 3;
-      for (int c = 0; c < 3; ++c) input[dst + c] = rgb[c] / 127.5f - 1.0f;
+      for (int c = 0; c < 3; ++c) input[dst + c] = half_bits(rgb[c] / 127.5f - 1.0f);
     }
   }
-  return input;
 }
 
 struct Anchor { float x, y; };
@@ -146,15 +201,14 @@ struct Detection {
   std::array<Point3, 6> keypoints;
 };
 
-Detection decode_detection(const std::vector<float>& raw_boxes,
-                           const std::vector<float>& raw_scores,
+Detection decode_detection(const float* raw_boxes, const float* raw_scores,
                            const Letterbox& letterbox) {
   static const std::vector<Anchor> anchors = make_anchors();
   size_t best = 0;
   for (size_t i = 1; i < anchors.size(); ++i)
     if (raw_scores[i] > raw_scores[best]) best = i;
   float score_logit = std::max(-100.0f, std::min(raw_scores[best], 100.0f));
-  const float* r = raw_boxes.data() + best * 16;
+  const float* r = raw_boxes + best * 16;
   auto image_x = [&](float normalized) { return (normalized * 128 - letterbox.pad_x) / letterbox.scale; };
   auto image_y = [&](float normalized) { return (normalized * 128 - letterbox.pad_y) / letterbox.scale; };
   float cx = r[0] / 128 + anchors[best].x;
@@ -174,10 +228,10 @@ Detection decode_detection(const std::vector<float>& raw_boxes,
 
 struct Roi { float cx, cy, w, h, rotation; };
 
-std::vector<float> landmark_input(const Image& image, const Roi& roi) {
+template <typename T>
+void landmark_input(const T& image, const Roi& roi, uint16_t* input) {
   constexpr int size = 256;
   float cs = std::cos(roi.rotation), sn = std::sin(roi.rotation);
-  std::vector<float> input(size * size * 3);
   for (int y = 0; y < size; ++y) {
     for (int x = 0; x < size; ++x) {
       float local_x = (x + 0.5f) / size - 0.5f;
@@ -187,15 +241,12 @@ std::vector<float> landmark_input(const Image& image, const Roi& roi) {
       float rgb[3];
       sample_rgb(image, src_x, src_y, rgb);
       size_t dst = (y * size + x) * 3;
-      for (int c = 0; c < 3; ++c) input[dst + c] = rgb[c] / 255.0f;
+      for (int c = 0; c < 3; ++c) input[dst + c] = half_bits(rgb[c] / 255.0f);
     }
   }
-  return input;
 }
 
-std::vector<Point3> project_landmarks(const std::vector<float>& raw,
-                                      const Roi& roi, int image_w, int image_h) {
-  if (raw.size() < 478 * 3) throw std::runtime_error("short landmark output");
+std::vector<Point3> project_landmarks(const float* raw, const Roi& roi, int image_w, int image_h) {
   float cs = std::cos(roi.rotation), sn = std::sin(roi.rotation);
   std::vector<Point3> points(478);
   for (int i = 0; i < 478; ++i) {
@@ -230,13 +281,11 @@ const char* kBlendNames[52] = {
   "mouthUpperUpRight","noseSneerLeft","noseSneerRight"
 };
 
-std::vector<float> blend_input(const std::vector<Point3>& points, int w, int h) {
-  std::vector<float> input(146 * 2);
+void blend_input(const std::vector<Point3>& points, int w, int h, uint16_t* input) {
   for (int i = 0; i < 146; ++i) {
-    input[i * 2] = points[kBlendLandmarks[i]].x * w;
-    input[i * 2 + 1] = points[kBlendLandmarks[i]].y * h;
+    input[i * 2] = half_bits(points[kBlendLandmarks[i]].x * w);
+    input[i * 2 + 1] = half_bits(points[kBlendLandmarks[i]].y * h);
   }
-  return input;
 }
 
 Point3 sub(Point3 a, Point3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
@@ -273,13 +322,66 @@ void draw_point(Image& image, int x, int y) {
     for (int dx = -1; dx <= 1; ++dx) pixel(image, x + dx, y + dy, 30, 255, 90);
 }
 
+void pixel(Nv12Image& image, int x, int y, unsigned char r, unsigned char g, unsigned char b) {
+  if (x < 0 || y < 0 || x >= image.w || y >= image.h) return;
+  int luma = ((47 * r + 157 * g + 16 * b + 128) >> 8) + 16;
+  int u = ((-26 * r - 87 * g + 112 * b + 128) >> 8) + 128;
+  int v = ((112 * r - 102 * g - 10 * b + 128) >> 8) + 128;
+  image.y[y * image.y_stride + x] = static_cast<unsigned char>(std::clamp(luma, 0, 255));
+  size_t uv = static_cast<size_t>(y / 2) * image.uv_stride + (x / 2) * 2;
+  image.uv[uv] = static_cast<unsigned char>(std::clamp(u, 0, 255));
+  image.uv[uv + 1] = static_cast<unsigned char>(std::clamp(v, 0, 255));
+}
+
+void draw_point(Nv12Image& image, int x, int y) {
+  for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx) pixel(image, x + dx, y + dy, 30, 255, 90);
+}
+
 }  // namespace
 
 struct Tracker::Impl {
   explicit Impl(const std::string& dir)
       : detector(dir + "/rknn_face_detector.rknn"),
         landmarker(dir + "/rknn_face_landmarks.rknn"),
-        blendshapes(dir + "/tf2onnx_face_blendshapes.rknn") {}
+        blendshapes(dir + "/tf2onnx_face_blendshapes.rknn") {
+    if (detector.input_size() != 128 * 128 * 3 || detector.output_size(0) < 896 * 16 ||
+        detector.output_size(1) < 896 || landmarker.input_size() != 256 * 256 * 3 ||
+        landmarker.output_size(0) < 478 * 3 || blendshapes.input_size() != 146 * 2 ||
+        blendshapes.output_size(0) < 52)
+      throw std::runtime_error("unexpected model tensor shape");
+  }
+
+  template <typename T>
+  bool process(const T& image, Result& result) {
+    result = Result{};
+    Letterbox letterbox{};
+    detector_input(image, letterbox, detector.input());
+    detector.run(&result.detector_ms);
+    Detection detection = decode_detection(detector.output(0), detector.output(1), letterbox);
+    result.score = detection.score;
+    if (detection.score < 0.5f) return false;
+
+    Roi roi{detection.x + detection.w / 2, detection.y + detection.h / 2,
+            detection.w * 1.5f, detection.h * 1.5f,
+            std::atan2(detection.keypoints[1].y - detection.keypoints[0].y,
+                       detection.keypoints[1].x - detection.keypoints[0].x)};
+    landmark_input(image, roi, landmarker.input());
+    landmarker.run(&result.landmark_ms);
+    result.landmark_presence = 1.0f / (1.0f + std::exp(-landmarker.output(1)[0]));
+    result.tongue_out = landmarker.output(2)[0];
+    result.landmarks = project_landmarks(landmarker.output(0), roi, image.w, image.h);
+    blend_input(result.landmarks, image.w, image.h, blendshapes.input());
+    blendshapes.run(&result.blendshape_ms);
+    std::copy_n(blendshapes.output(0), result.blendshapes.size(), result.blendshapes.begin());
+    result.head_pose_deg = head_pose(result.landmarks, image.w, image.h);
+    result.bbox_x = detection.x;
+    result.bbox_y = detection.y;
+    result.bbox_w = detection.w;
+    result.bbox_h = detection.h;
+    return true;
+  }
+
   RknnModel detector, landmarker, blendshapes;
 };
 
@@ -289,35 +391,31 @@ Tracker::~Tracker() = default;
 bool Tracker::process(const Image& image, Result& result) {
   if (image.w <= 0 || image.h <= 0 || image.rgb.size() != static_cast<size_t>(image.w) * image.h * 3)
     throw std::runtime_error("invalid RGB image");
-  result = Result{};
-  Letterbox letterbox{};
-  auto detector_outputs = impl_->detector.run(detector_input(image, letterbox), &result.detector_ms);
-  Detection detection = decode_detection(detector_outputs[0], detector_outputs[1], letterbox);
-  result.score = detection.score;
-  if (detection.score < 0.5f) return false;
+  return impl_->process(image, result);
+}
 
-  Roi roi{detection.x + detection.w / 2, detection.y + detection.h / 2,
-          detection.w * 1.5f, detection.h * 1.5f,
-          std::atan2(detection.keypoints[1].y - detection.keypoints[0].y,
-                     detection.keypoints[1].x - detection.keypoints[0].x)};
-  auto landmark_outputs = impl_->landmarker.run(landmark_input(image, roi), &result.landmark_ms);
-  result.landmark_presence = 1.0f / (1.0f + std::exp(-landmark_outputs[1][0]));
-  result.tongue_out = landmark_outputs[2][0];
-  result.landmarks = project_landmarks(landmark_outputs[0], roi, image.w, image.h);
-  auto blend_outputs = impl_->blendshapes.run(
-      blend_input(result.landmarks, image.w, image.h), &result.blendshape_ms);
-  if (blend_outputs[0].size() < result.blendshapes.size())
-    throw std::runtime_error("short blendshape output");
-  std::copy_n(blend_outputs[0].begin(), result.blendshapes.size(), result.blendshapes.begin());
-  result.head_pose_deg = head_pose(result.landmarks, image.w, image.h);
-  result.bbox_x = detection.x;
-  result.bbox_y = detection.y;
-  result.bbox_w = detection.w;
-  result.bbox_h = detection.h;
-  return true;
+bool Tracker::process(const Nv12Image& image, Result& result) {
+  if (image.w <= 0 || image.h <= 0 || !image.y || !image.uv ||
+      image.y_stride < image.w || image.uv_stride < image.w)
+    throw std::runtime_error("invalid NV12 image");
+  return impl_->process(image, result);
 }
 
 void draw(Image& image, const Result& result) {
+  int x0 = static_cast<int>(result.bbox_x), y0 = static_cast<int>(result.bbox_y);
+  int x1 = static_cast<int>(result.bbox_x + result.bbox_w);
+  int y1 = static_cast<int>(result.bbox_y + result.bbox_h);
+  for (int x = x0; x <= x1; ++x) {
+    pixel(image, x, y0, 255, 60, 30); pixel(image, x, y1, 255, 60, 30);
+  }
+  for (int y = y0; y <= y1; ++y) {
+    pixel(image, x0, y, 255, 60, 30); pixel(image, x1, y, 255, 60, 30);
+  }
+  for (const auto& p : result.landmarks)
+    draw_point(image, static_cast<int>(p.x * image.w), static_cast<int>(p.y * image.h));
+}
+
+void draw(Nv12Image& image, const Result& result) {
   int x0 = static_cast<int>(result.bbox_x), y0 = static_cast<int>(result.bbox_y);
   int x1 = static_cast<int>(result.bbox_x + result.bbox_w);
   int y1 = static_cast<int>(result.bbox_y + result.bbox_h);

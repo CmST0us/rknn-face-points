@@ -26,7 +26,13 @@ MPP 文件解码、打点和编码：
 ./run-video.sh [H.264 MP4/MOV 路径]
 ```
 
-结果为 `output/face-output.mp4`；视频链路使用 `mppvideodec`、RGA `videoconvert`、`rknnfacemesh` 和 `mpph264enc`（不保留音轨）。
+结果为 `output/face-output.mp4`（不保留音轨）。视频主链路为：
+
+```text
+MPP H.264 decode → NV12 DMABUF → rknnfacemesh → 同一 DMABUF → MPP H.264 encode
+```
+
+没有全帧 RGB 转换、`videoconvert` 或帧拷贝。
 
 V4L2 实时输入：
 
@@ -38,26 +44,30 @@ V4L2 实时输入：
 
 ## GStreamer 节点
 
-`rknnfacemesh` 接收并输出 `video/x-raw,format=RGB`；`draw=true` 默认在输出帧上绘制人脸框和 478 点，设为 `false` 可仅输出元数据：
+`rknnfacemesh` 接收并输出 NV12，运行时强制底层内存为 DMABUF；普通内存会直接报错，避免链路静默退化成拷贝模式。MPP 编码器的 pad template 不声明 `memory:DMABuf`，因此 caps 保持普通 `video/x-raw`，实际 FD 仍原样透传。
+
+`draw=true` 默认直接在 NV12 DMABUF 上绘制人脸框和 478 点；`inference-interval=2` 默认以 30Hz 推理并在相邻帧复用结果，使 60fps 视频保持实时。需要逐帧新结果时设为 `1`：
 
 ```sh
 docker compose run --rm --no-deps gstreamer-face -e \
-  v4l2src device=/dev/video0 ! videoconvert ! video/x-raw,format=RGB ! \
-  rknnfacemesh model-dir=/app/models draw=true ! videoconvert ! fakesink
+  v4l2src device=/dev/video0 io-mode=dmabuf ! video/x-raw,format=NV12 ! \
+  rknnfacemesh model-dir=/app/models draw=true inference-interval=1 ! \
+  mpph264enc ! h264parse ! fakesink
 ```
 
 每帧附带 `GstRknnFaceMeta`，包含 bbox、478 个 xyz 点、yaw/pitch/roll、52 个 blendshape、`tongue_out` 和 NPU 耗时。应用侧结构与访问函数见 `include/gst_rknn_face_meta.h`。
 
-## RGA 与 NEON
+## 零拷贝与性能
 
-Compose 默认设置：
+MPP 解码输出、插件输入/输出和 MPP 编码输入始终是同一个 NV12 DMABUF。插件只映射模型实际采样的像素，预处理直接写入启动时创建并复用的 RKNN DMA tensor；框和点原地写回 NV12。`DMA_BUF_IOCTL_SYNC` 用于 CPU 与 MPP 的缓存一致性。
 
-```sh
-GST_VIDEO_CONVERT_USE_RGA=1
-GST_VIDEO_CONVERT_RGA_DMA_HEAP=/dev/dma_heap/cma
-```
+在 ROCK 5B / RK3588 上使用仓库测试视频（2688×1512、60fps、169 帧）：
 
-镜像内的 GStreamer 1.24.2 `libgstvideo` 同时链接 Rockchip `librga` 和 ORC：支持格式走 RGA；RGA 不支持或失败时回退到 ORC 的 AArch64 NEON 路径。CMA DMA buffer 修复了 RK3588 旧补丁使用 4GB 以上虚拟地址时的 `RGA_BLIT EINVAL`。
+- MPP 解码 + 打点：2.497 秒，67.7fps。
+- MPP 解码 + 打点 + MPP H.264 编码：2.523 秒，67.0fps。
+- `inference-interval=1` 的逐帧推理约 33fps。
+
+旧 RGA/ORC-NEON `videoconvert` 补丁与构建脚本仍保留在 `rockchip/` 和 `scripts/build-rga-gstvideo.sh`，用于必须转换格式的外部管线；零拷贝主链路不再调用它们。
 
 Rockchip MPP 在容器内导出解码帧需要访问板端媒体设备与 DMA heaps，因此 `gstreamer-face` 服务使用 `privileged: true`；RKNN 单图服务仍只映射 NPU。Rockchip MPP 插件和运行库从目标设备只读挂载，保持与板端驱动匹配。
 
@@ -88,5 +98,5 @@ src/          共用推理核心、CLI、GStreamer 滤镜源码
 include/      RKNN API 与 GstRknnFaceMeta 头文件
 models/       三个 RKNN 模型
 rockchip/     librga、RGA+ORC libgstvideo、头文件与补丁
-scripts/      三个可复现构建脚本
+scripts/      可复现构建脚本
 ```
