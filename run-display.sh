@@ -20,12 +20,11 @@ if [ -c "$source" ]; then
 fi
 
 case "$source" in
-  rtmp://*|rtmps://*)
+  http://*|https://*)
     exec docker compose run --rm --no-deps \
       -e "XDG_RUNTIME_DIR=$runtime" -e "WAYLAND_DISPLAY=$display" -v "$runtime:$runtime" \
-      gstreamer-face -e rtmpsrc "location=$source" "!" flvdemux name=d \
-      d.video "!" queue "!" h264parse "!" mppvideodec dma-feature=true format=NV12 \
-      "!" queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream \
+      gstreamer-face -e uridecodebin "uri=$source" caps=video/x-raw,format=NV12 name=d \
+      d. "!" queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream \
       "!" rknnfacemesh \
       "!" queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream \
       "!" waylandsink sync=false

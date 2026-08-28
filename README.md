@@ -47,10 +47,10 @@ GNOME Wayland 实时显示：
 ```sh
 ./run-display.sh /dev/video0
 # 或播放文件：./run-display.sh assets/test.mov
-# 或 RTMP/H.264 直播：./run-display.sh 'rtmp://server/live/stream'
+# 或 HLS/m3u8 直播：./run-display.sh 'https://server/live/stream.m3u8'
 ```
 
-默认连接 `/run/user/1000/wayland-0`；其他会话可设置 `WAYLAND_RUNTIME_DIR` 和 `WAYLAND_DISPLAY`。V4L2 输入强制直接采集 NV12 DMABUF；文件和 RTMP 使用 MPP 硬件解码，随后保持同一块 DMABUF 原地打点并由 `waylandsink` 导入显示。
+默认连接 `/run/user/1000/wayland-0`；其他会话可设置 `WAYLAND_RUNTIME_DIR` 和 `WAYLAND_DISPLAY`。V4L2 输入强制直接采集 NV12 DMABUF；文件和 HLS 使用 MPP 硬件解码，随后保持同一块 DMABUF 原地打点并由 `waylandsink` 导入显示。
 
 ## GStreamer 节点
 
