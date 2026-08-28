@@ -77,6 +77,8 @@ MPP 解码输出、插件输入/输出和 MPP 编码输入始终是同一个 NV1
 - MPP 解码 + 打点 + MPP H.264 编码：2.523 秒，67.0fps。
 - `inference-interval=1` 的逐帧推理约 33fps。
 
+指定 Bilibili HLS（1600×1280、30fps）经 MPP 解码 + DMABUF + RKNN + `fakesink` 连续验收 45 秒：1290 帧、累计平均 31.1fps、0 drops。HLS 解码按分片突发输出，因此推理前使用背压队列，不能使用两帧 `leaky` 队列。
+
 旧 RGA/ORC-NEON `videoconvert` 补丁与构建脚本仍保留在 `rockchip/` 和 `scripts/build-rga-gstvideo.sh`，用于必须转换格式的外部管线；零拷贝主链路不再调用它们。
 
 Rockchip MPP 在容器内导出解码帧需要访问板端媒体设备与 DMA heaps，因此 `gstreamer-face` 服务使用 `privileged: true`；RKNN 单图服务仍只映射 NPU。Rockchip MPP 插件和运行库从目标设备只读挂载，保持与板端驱动匹配。

@@ -24,7 +24,7 @@ case "$source" in
     exec docker compose run --rm --no-deps \
       -e "XDG_RUNTIME_DIR=$runtime" -e "WAYLAND_DISPLAY=$display" -v "$runtime:$runtime" \
       gstreamer-face -e uridecodebin "uri=$source" caps=video/x-raw,format=NV12 name=d \
-      d. "!" queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream \
+      d. "!" queue \
       "!" rknnfacemesh \
       "!" queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream \
       "!" waylandsink sync=false
