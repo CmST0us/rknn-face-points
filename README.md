@@ -42,6 +42,16 @@ V4L2 实时输入：
 
 结果为 `output/face-output.mkv`。ROCK 5B 的 `/dev/video0` 是 HDMI RX 时，需要先接入有效 HDMI 信号。
 
+GNOME Wayland 实时显示：
+
+```sh
+./run-display.sh /dev/video0
+# 或播放文件：./run-display.sh assets/test.mov
+# 或 RTMP/H.264 直播：./run-display.sh 'rtmp://server/live/stream'
+```
+
+默认连接 `/run/user/1000/wayland-0`；其他会话可设置 `WAYLAND_RUNTIME_DIR` 和 `WAYLAND_DISPLAY`。V4L2 输入强制直接采集 NV12 DMABUF；文件和 RTMP 使用 MPP 硬件解码，随后保持同一块 DMABUF 原地打点并由 `waylandsink` 导入显示。
+
 ## GStreamer 节点
 
 `rknnfacemesh` 接收并输出 NV12，运行时强制底层内存为 DMABUF；普通内存会直接报错，避免链路静默退化成拷贝模式。MPP 编码器的 pad template 不声明 `memory:DMABuf`，因此 caps 保持普通 `video/x-raw`，实际 FD 仍原样透传。
