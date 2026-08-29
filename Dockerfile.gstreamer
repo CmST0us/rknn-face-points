@@ -9,7 +9,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=wayland /usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstwaylandsink.so /usr/lib/aarch64-linux-gnu/gstreamer-1.0/
 COPY --from=wayland /usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgsthls.so /usr/lib/aarch64-linux-gnu/gstreamer-1.0/
+COPY --from=wayland /usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstmpegtsdemux.so /usr/lib/aarch64-linux-gnu/gstreamer-1.0/
 COPY --from=wayland /usr/lib/aarch64-linux-gnu/libgstadaptivedemux-1.0.so.0* /usr/lib/aarch64-linux-gnu/
+COPY --from=wayland /usr/lib/aarch64-linux-gnu/libgstcodecparsers-1.0.so.0* /usr/lib/aarch64-linux-gnu/
+COPY --from=wayland /usr/lib/aarch64-linux-gnu/libgstmpegts-1.0.so.0* /usr/lib/aarch64-linux-gnu/
 COPY --from=wayland /usr/lib/aarch64-linux-gnu/libgsturidownloader-1.0.so.0* /usr/lib/aarch64-linux-gnu/
 COPY --from=wayland /usr/lib/aarch64-linux-gnu/libgstwayland-1.0.so.0* /usr/lib/aarch64-linux-gnu/
 COPY --from=wayland /usr/lib/aarch64-linux-gnu/libwayland-client.so.0* /usr/lib/aarch64-linux-gnu/
