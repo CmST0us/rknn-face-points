@@ -28,7 +28,7 @@ case "$source" in
       p. "!" video/x-h264 "!" queue "!" h264parse \
       "!" mppvideodec dma-feature=true format=NV12 "!" queue \
       "!" rknnfacemesh \
-      "!" queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream \
+      "!" queue max-size-buffers=4 max-size-bytes=0 max-size-time=0 \
       "!" waylandsink "drm-device=$drm" sync=true
     ;;
 esac
