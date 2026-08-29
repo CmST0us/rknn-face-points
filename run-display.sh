@@ -24,11 +24,12 @@ case "$source" in
   http://*|https://*)
     exec docker compose run --rm --no-deps \
       -e "XDG_RUNTIME_DIR=$runtime" -e "WAYLAND_DISPLAY=$display" -v "$runtime:$runtime" \
-      gstreamer-face -e uridecodebin "uri=$source" caps=video/x-raw,format=NV12 name=d \
-      d. "!" queue \
+      gstreamer-face -e souphttpsrc "location=$source" "!" hlsdemux "!" parsebin name=p \
+      p. "!" video/x-h264 "!" queue "!" h264parse \
+      "!" mppvideodec dma-feature=true format=NV12 "!" queue \
       "!" rknnfacemesh \
       "!" queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream \
-      "!" waylandsink "drm-device=$drm" sync=false
+      "!" waylandsink "drm-device=$drm" sync=true
     ;;
 esac
 

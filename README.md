@@ -50,7 +50,7 @@ GNOME Wayland 实时显示：
 # 或 HLS/m3u8 直播：./run-display.sh 'https://server/live/stream.m3u8'
 ```
 
-默认连接 `/run/user/1000/wayland-0`；其他会话可设置 `WAYLAND_RUNTIME_DIR` 和 `WAYLAND_DISPLAY`。V4L2 输入强制直接采集 NV12 DMABUF；HLS 支持 fMP4/m4s 与 MPEG-TS 分片。MPP 解码到 RKNN 打点保持 DMABUF；`waylandsink` 使用 `/dev/dri/card0` 生成 compositor 可导入的显示缓冲，避免非标准 stride 花屏，其他设备可设置 `DRM_DEVICE`。
+默认连接 `/run/user/1000/wayland-0`；其他会话可设置 `WAYLAND_RUNTIME_DIR` 和 `WAYLAND_DISPLAY`。V4L2 输入强制直接采集 NV12 DMABUF；HLS 支持 fMP4/m4s 与 MPEG-TS 分片，只选择 H.264 视频轨并按 PTS 播放，音频不会触发全局缓冲。MPP 解码到 RKNN 打点保持 DMABUF；`waylandsink` 使用 `/dev/dri/card0` 生成 compositor 可导入的显示缓冲，避免非标准 stride 花屏，其他设备可设置 `DRM_DEVICE`。
 
 ## GStreamer 节点
 
